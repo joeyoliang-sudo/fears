@@ -207,8 +207,19 @@ QUALIFICATION_MAP = {
     "5": "消費者/病患",
 }
 
+# FAERS reactionoutcome codes — see FDA E2B mapping
+REACTION_OUTCOME_MAP = {
+    "1": "已恢復/緩解",
+    "2": "恢復中",
+    "3": "未恢復",
+    "4": "恢復伴後遺症",
+    "5": "死亡",
+    "6": "未知",
+}
+
 CASE_COLUMNS = [
-    "安全報告 ID", "用藥劑量 (Dose)", "給藥途徑", "適應症",
+    "安全報告 ID", "事件類型 (MedDRA PT)", "事件結果",
+    "用藥劑量 (Dose)", "給藥途徑", "適應症",
     "嚴重度", "年齡", "性別", "通報國家", "通報者身分",
 ]
 
@@ -348,10 +359,20 @@ def get_detailed_events(
         return []
 
 
-def parse_events_to_dataframe(events: list[dict[str, Any]], drug_name: str) -> pd.DataFrame:
-    """Always returns a DataFrame containing every column in CASE_COLUMNS."""
+def parse_events_to_dataframe(
+    events: list[dict[str, Any]],
+    drug_name: str,
+    target_reaction: str = "",
+) -> pd.DataFrame:
+    """Always returns a DataFrame containing every column in CASE_COLUMNS.
+
+    Each FAERS report can carry multiple reactions; we expose the full set
+    in ``事件類型 (MedDRA PT)`` (the searched-for term sorted to the front)
+    and the per-reaction outcomes in ``事件結果``.
+    """
     records: list[dict[str, Any]] = []
     drug_upper = drug_name.upper()
+    target_upper = target_reaction.strip().upper()
 
     for event in events:
         record: dict[str, Any] = {col: "N/A" for col in CASE_COLUMNS}
@@ -379,6 +400,24 @@ def parse_events_to_dataframe(events: list[dict[str, Any]], drug_name: str) -> p
             patient = event.get("patient", {}) or {}
             record["年齡"] = patient.get("patientonsetage", "N/A")
             record["性別"] = {"1": "男", "2": "女"}.get(patient.get("patientsex"), "未知")
+
+            reactions = patient.get("reaction", []) or []
+            pt_terms: list[str] = []
+            outcomes: list[str] = []
+            for r in reactions:
+                pt = (r.get("reactionmeddrapt") or "").strip()
+                if pt:
+                    pt_terms.append(pt)
+                outcome = REACTION_OUTCOME_MAP.get(r.get("reactionoutcome"), "")
+                if outcome:
+                    outcomes.append(outcome)
+            if target_upper:
+                # Move the searched-for reaction to the front so it's visible at a glance.
+                pt_terms.sort(key=lambda t: 0 if t.upper() == target_upper else 1)
+            if pt_terms:
+                record["事件類型 (MedDRA PT)"] = "; ".join(dict.fromkeys(pt_terms))
+            if outcomes:
+                record["事件結果"] = "; ".join(dict.fromkeys(outcomes))
 
             for drug in patient.get("drug", []) or []:
                 product = (drug.get("medicinalproduct") or "").upper()
@@ -624,6 +663,30 @@ def main() -> None:
                     else:
                         st.info("無足夠資料繪製適應症分佈。")
 
+                st.markdown("#### 🧬 共病反應 Top 10 (同案件並列出現的其他 MedDRA PT)")
+                co_reactions = get_distribution_data(
+                    target_drug, current_side_effect, "patient.reaction.reactionmeddrapt.exact", 11
+                )
+                if co_reactions:
+                    df_co = pd.DataFrame(co_reactions)
+                    df_co = df_co[
+                        df_co["term"].str.upper() != current_side_effect.strip().upper()
+                    ].head(10)
+                    if not df_co.empty:
+                        fig_co = px.bar(
+                            df_co, x="term", y="count", template=PLOTLY_TEMPLATE,
+                        )
+                        fig_co.update_layout(
+                            xaxis_title="MedDRA PT",
+                            yaxis_title="共現案件數",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="#0f172a"),
+                        )
+                        st.plotly_chart(fig_co, use_container_width=True)
+                    else:
+                        st.info("除目標反應外，其他共病訊號不足。")
+
         with tab3:
             st.markdown("### 💊 臨床案件劑量檢閱器 (Case Browser)")
             target_drug = st.selectbox(
@@ -639,7 +702,9 @@ def main() -> None:
                         target_drug, current_side_effect, limit=case_limit
                     )
                     if raw_cases:
-                        df_cases = parse_events_to_dataframe(raw_cases, target_drug)
+                        df_cases = parse_events_to_dataframe(
+                            raw_cases, target_drug, target_reaction=current_side_effect
+                        )
                         st.session_state["df_cases"] = df_cases
                         st.session_state["cases_loaded_drug"] = target_drug
                     else:
@@ -652,17 +717,21 @@ def main() -> None:
                 df_cases: pd.DataFrame = st.session_state["df_cases"]
 
                 serious_count = int(df_cases["嚴重度"].astype(str).str.startswith("嚴重").sum())
-                m1, m2, m3 = st.columns(3)
+                fatal_count = int(
+                    df_cases["事件結果"].astype(str).str.contains("死亡", na=False).sum()
+                )
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("載入案件總數", f"{len(df_cases):,}")
                 m2.metric("嚴重案件數", f"{serious_count:,}")
                 m3.metric("非嚴重案件數", f"{len(df_cases) - serious_count:,}")
+                m4.metric("結果為死亡", f"{fatal_count:,}")
 
                 st.success(
                     f"✅ 成功載入 {len(df_cases)} 筆案件紀錄！(下方表格為固定高度，可直接上下捲動)"
                 )
 
                 with st.expander("🔎 篩選條件", expanded=False):
-                    f1, f2 = st.columns(2)
+                    f1, f2, f3 = st.columns(3)
                     severity_filter = f1.multiselect(
                         "嚴重度",
                         sorted(df_cases["嚴重度"].dropna().unique().tolist()),
@@ -673,12 +742,23 @@ def main() -> None:
                         sorted(df_cases["通報者身分"].dropna().unique().tolist()),
                         default=[],
                     )
+                    reaction_keyword = f3.text_input(
+                        "事件類型包含 (MedDRA PT)",
+                        value="",
+                        placeholder="例如 Ketoacidosis",
+                    )
 
                 view_df = df_cases
                 if severity_filter:
                     view_df = view_df[view_df["嚴重度"].isin(severity_filter)]
                 if reporter_filter:
                     view_df = view_df[view_df["通報者身分"].isin(reporter_filter)]
+                if reaction_keyword.strip():
+                    view_df = view_df[
+                        view_df["事件類型 (MedDRA PT)"]
+                        .astype(str)
+                        .str.contains(reaction_keyword.strip(), case=False, na=False)
+                    ]
 
                 st.markdown(f"#### 📋 完整案件清單（{len(view_df):,} / {len(df_cases):,} 筆）")
                 st.dataframe(
