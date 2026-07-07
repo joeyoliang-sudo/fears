@@ -3,7 +3,7 @@
 🏥 臨床藥物不良反應 (ADR) 智能監測儀表板
 FDA FAERS Pharmacovigilance Analytics Platform
 ====================================================
-Version: 4.0 (Light Theme · Scrollable Case Browser · Hardened API)
+Version: 4.1 (Consistent Alias Queries · Readable Case Fields · Error Surfacing)
 ====================================================
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -217,6 +218,35 @@ REACTION_OUTCOME_MAP = {
     "6": "未知",
 }
 
+# E2B route of administration codes (openFDA drugadministrationroute)
+ROUTE_MAP = {
+    "030": "肌肉注射",
+    "040": "靜脈推注",
+    "041": "靜脈滴注",
+    "042": "靜脈注射",
+    "045": "鼻腔給藥",
+    "047": "眼用",
+    "048": "口服",
+    "050": "其他",
+    "054": "直腸給藥",
+    "055": "吸入",
+    "058": "皮下注射",
+    "060": "舌下",
+    "061": "局部外用",
+    "062": "經皮",
+    "065": "未知",
+}
+
+# E2B patientonsetageunit codes
+AGE_UNIT_MAP = {
+    "800": "十年",
+    "801": "歲",
+    "802": "個月",
+    "803": "週",
+    "804": "天",
+    "805": "小時",
+}
+
 CASE_COLUMNS = [
     "安全報告 ID", "事件類型 (MedDRA PT)", "事件結果",
     "用藥劑量 (Dose)", "給藥途徑", "適應症",
@@ -229,13 +259,31 @@ def _sanitize(value: str) -> str:
     return value.replace("\\", "").replace('"', "").strip()
 
 
+@st.cache_resource(show_spinner=False)
 def get_session() -> requests.Session:
+    """Shared session — reuses TCP connections and honours openFDA 429 rate limits."""
     session = requests.Session()
-    retry = Retry(total=3, connect=3, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504))
+    retry = Retry(
+        total=3,
+        connect=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        respect_retry_after_header=True,
+    )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
+
+def _drug_query_clause(terms: tuple[str, ...]) -> str:
+    """Lucene clause matching any of the given product/generic names."""
+    terms_str = " ".join(f'"{t}"' for t in terms)
+    return f"patient.drug.medicinalproduct:({terms_str})"
+
+
+def _safe_filename(name: str) -> str:
+    return re.sub(r"[^\w\-]+", "_", name).strip("_") or "data"
 
 
 # ==========================================
@@ -255,8 +303,11 @@ def check_label_risk(drug_name: str, side_effect: str) -> tuple[bool, str, list[
         response = get_session().get(
             OPENFDA_LABEL_URL, params={"search": query, "limit": 1}, timeout=REQUEST_TIMEOUT
         )
-        if response.status_code != 200:
+        if response.status_code == 404:
             return False, "仿單中未找到明確關聯", []
+        if response.status_code != 200:
+            log.info("check_label_risk status=%s body=%s", response.status_code, response.text[:200])
+            return False, "仿單查詢失敗", []
         results = response.json().get("results", [])
         if not results:
             return False, "仿單中未找到明確關聯", []
@@ -280,13 +331,12 @@ def count_faers_events(
     input_name: str, side_effect: str, alias_list: list[str] | None = None
 ) -> tuple[int, list[str]]:
     aliases = alias_list or []
-    terms = {_sanitize(t) for t in [input_name, *aliases] if _sanitize(t)}
+    terms = sorted({_sanitize(t) for t in [input_name, *aliases] if _sanitize(t)})
     if not terms:
         return 0, []
     se = _sanitize(side_effect)
-    terms_str = " ".join(f'"{t}"' for t in terms)
     query = (
-        f"patient.drug.medicinalproduct:({terms_str}) "
+        f"{_drug_query_clause(tuple(terms))} "
         f'AND patient.reaction.reactionmeddrapt:"{se}"'
     )
     try:
@@ -297,26 +347,26 @@ def count_faers_events(
             total = (
                 response.json().get("meta", {}).get("results", {}).get("total", 0)
             )
-            return total, list(terms)
+            return total, terms
         if response.status_code == 404:
-            return 0, list(terms)
+            return 0, terms
         log.info("count_faers_events status=%s body=%s", response.status_code, response.text[:200])
-        return 0, list(terms)
+        return -1, terms
     except requests.RequestException as exc:
         log.warning("count_faers_events failed: %s", exc)
-        return -1, []
+        return -1, terms
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_distribution_data(
-    drug_name: str, side_effect: str, field_name: str, limit: int = 20
+    drug_terms: tuple[str, ...], side_effect: str, field_name: str, limit: int = 20
 ) -> list[dict[str, Any]]:
-    drug = _sanitize(drug_name)
+    terms = tuple(t for t in (_sanitize(t) for t in drug_terms) if t)
     se = _sanitize(side_effect)
-    if not drug or not se:
+    if not terms or not se:
         return []
     query = (
-        f'patient.drug.medicinalproduct:"{drug}" '
+        f"{_drug_query_clause(terms)} "
         f'AND patient.reaction.reactionmeddrapt:"{se}"'
     )
     try:
@@ -335,20 +385,21 @@ def get_distribution_data(
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_detailed_events(
-    drug_name: str, side_effect: str, limit: int = 100
+    drug_terms: tuple[str, ...], side_effect: str, limit: int = 100
 ) -> list[dict[str, Any]]:
-    drug = _sanitize(drug_name)
+    terms = tuple(t for t in (_sanitize(t) for t in drug_terms) if t)
     se = _sanitize(side_effect)
-    if not drug or not se:
+    if not terms or not se:
         return []
     query = (
-        f'patient.drug.medicinalproduct:"{drug}" '
+        f"{_drug_query_clause(terms)} "
         f'AND patient.reaction.reactionmeddrapt:"{se}"'
     )
     try:
         response = get_session().get(
             OPENFDA_EVENT_URL,
-            params={"search": query, "limit": limit},
+            # sort by receipt date so「近期案件」真的是最近通報的案件
+            params={"search": query, "limit": limit, "sort": "receiptdate:desc"},
             timeout=REQUEST_TIMEOUT + 5,
         )
         if response.status_code == 200:
@@ -359,9 +410,34 @@ def get_detailed_events(
         return []
 
 
+def _format_age(patient: dict[str, Any]) -> str:
+    age = patient.get("patientonsetage")
+    if not age:
+        return "N/A"
+    unit = AGE_UNIT_MAP.get(str(patient.get("patientonsetageunit", "")), "")
+    return f"{age} {unit}".strip()
+
+
+def _match_drug_record(patient: dict[str, Any], term_uppers: list[str]) -> dict[str, Any] | None:
+    """Find the drug record for the searched drug (by product or openFDA names),
+    falling back to the first suspect drug (drugcharacterization == '1')."""
+    drugs = patient.get("drug", []) or []
+    for drug in drugs:
+        names = [(drug.get("medicinalproduct") or "").upper()]
+        openfda = drug.get("openfda", {}) or {}
+        names += [n.upper() for n in (openfda.get("generic_name") or [])]
+        names += [n.upper() for n in (openfda.get("brand_name") or [])]
+        if any(term in name for term in term_uppers for name in names if name):
+            return drug
+    for drug in drugs:
+        if drug.get("drugcharacterization") == "1":
+            return drug
+    return None
+
+
 def parse_events_to_dataframe(
     events: list[dict[str, Any]],
-    drug_name: str,
+    drug_terms: tuple[str, ...],
     target_reaction: str = "",
 ) -> pd.DataFrame:
     """Always returns a DataFrame containing every column in CASE_COLUMNS.
@@ -371,7 +447,7 @@ def parse_events_to_dataframe(
     and the per-reaction outcomes in ``事件結果``.
     """
     records: list[dict[str, Any]] = []
-    drug_upper = drug_name.upper()
+    term_uppers = [t.upper() for t in drug_terms if t]
     target_upper = target_reaction.strip().upper()
 
     for event in events:
@@ -398,8 +474,8 @@ def parse_events_to_dataframe(
             )
 
             patient = event.get("patient", {}) or {}
-            record["年齡"] = patient.get("patientonsetage", "N/A")
-            record["性別"] = {"1": "男", "2": "女"}.get(patient.get("patientsex"), "未知")
+            record["年齡"] = _format_age(patient)
+            record["性別"] = {"1": "男", "2": "女"}.get(str(patient.get("patientsex", "")), "未知")
 
             reactions = patient.get("reaction", []) or []
             pt_terms: list[str] = []
@@ -419,18 +495,17 @@ def parse_events_to_dataframe(
             if outcomes:
                 record["事件結果"] = "; ".join(dict.fromkeys(outcomes))
 
-            for drug in patient.get("drug", []) or []:
-                product = (drug.get("medicinalproduct") or "").upper()
-                if drug_upper in product:
-                    dose_text = drug.get("drugdosagetext") or ""
-                    if not dose_text:
-                        cum_dose = drug.get("drugcumulativedosagenumb", "")
-                        unit = drug.get("drugcumulativedosageunit", "")
-                        dose_text = f"{cum_dose} {unit}".strip() if cum_dose else "未提供"
-                    record["用藥劑量 (Dose)"] = dose_text
-                    record["給藥途徑"] = drug.get("drugadministrationroute", "N/A")
-                    record["適應症"] = drug.get("drugindication", "N/A")
-                    break
+            drug = _match_drug_record(patient, term_uppers)
+            if drug is not None:
+                dose_text = drug.get("drugdosagetext") or ""
+                if not dose_text:
+                    cum_dose = drug.get("drugcumulativedosagenumb", "")
+                    unit = drug.get("drugcumulativedosageunit", "")
+                    dose_text = f"{cum_dose} {unit}".strip() if cum_dose else "未提供"
+                record["用藥劑量 (Dose)"] = dose_text
+                route = str(drug.get("drugadministrationroute") or "")
+                record["給藥途徑"] = ROUTE_MAP.get(route, route or "N/A")
+                record["適應症"] = drug.get("drugindication", "N/A")
 
             records.append(record)
         except Exception as exc:  # noqa: BLE001 — last-resort guard, logged below
@@ -454,7 +529,7 @@ def _summary_dataframe(results: list[dict[str, Any]]) -> pd.DataFrame:
             {
                 "藥品": r["drug"],
                 "風險等級": r["risk_level"],
-                "FAERS 案件數": r["event_count"],
+                "FAERS 案件數": r["event_count"] if r["event_count"] >= 0 else None,
                 "FDA 仿單收載": "是" if r["in_label"] else "否",
                 "評估依據": r["risk_reason"],
             }
@@ -470,7 +545,7 @@ def main() -> None:
     st.markdown(
         """
         <div class="main-header">
-            <h1>🏥 全球 ADR 智能監測儀表板 (V4.0)</h1>
+            <h1>🏥 全球 ADR 智能監測儀表板 (V4.1)</h1>
             <p>基於 FDA FAERS 數據的臨床藥物警戒與劑量風險分析平台</p>
         </div>
         """,
@@ -487,12 +562,15 @@ def main() -> None:
         side_effect = st.text_input("🎯 目標不良反應 (MedDRA PT)", value="Heart failure")
         st.markdown("---")
         st.markdown("### ⚙️ 風險閾值設定")
-        high_threshold = st.number_input("🔴 高風險警示 (通報數 ≥)", value=500, step=100)
-        medium_threshold = st.number_input("🟠 中風險警示 (通報數 ≥)", value=100, step=50)
+        high_threshold = st.number_input("🔴 高風險警示 (通報數 ≥)", min_value=1, value=500, step=100)
+        medium_threshold = st.number_input("🟠 中風險警示 (通報數 ≥)", min_value=1, value=100, step=50)
+        if medium_threshold > high_threshold:
+            st.warning("⚠️ 中風險閾值高於高風險閾值，已自動以高風險閾值為上限。")
+            medium_threshold = high_threshold
 
-        analyze_btn = st.button("🚀 執行深度分析", use_container_width=True)
+        analyze_btn = st.button("🚀 執行深度分析", width="stretch")
         if st.session_state.get("is_analyzed"):
-            if st.button("🧹 重設分析", use_container_width=True):
+            if st.button("🧹 重設分析", width="stretch"):
                 for key in ("is_analyzed", "all_results", "current_side_effect", "analyzed_at"):
                     st.session_state.pop(key, None)
                 _reset_case_state()
@@ -513,7 +591,9 @@ def main() -> None:
             in_label, label_excerpt, generics = check_label_risk(drug, side_effect)
             event_count, used_terms = count_faers_events(drug, side_effect, generics)
 
-            if in_label:
+            if event_count < 0 and not in_label:
+                risk_level, risk_reason = "查詢失敗", "❌ FAERS 查詢失敗，無法評估（請稍後重試）"
+            elif in_label:
                 risk_level, risk_reason = "高風險", "✅ 已明確記載於 FDA 仿單"
             elif event_count >= high_threshold:
                 risk_level, risk_reason = "高風險", f"⚠️ FAERS 訊號強烈 ({event_count:,} 筆通報)"
@@ -547,6 +627,10 @@ def main() -> None:
         all_results: list[dict[str, Any]] = st.session_state["all_results"]
         current_side_effect: str = st.session_state["current_side_effect"]
         analyzed_at: str = st.session_state.get("analyzed_at", "")
+        # 各分頁查詢沿用摘要分析時的「商品名 + 學名」聯集，確保數字彼此一致
+        drug_terms_map: dict[str, tuple[str, ...]] = {
+            r["drug"]: tuple(r["used_terms"] or [r["drug"]]) for r in all_results
+        }
 
         st.caption(
             f"🕒 分析時間：{analyzed_at} ｜ 不良反應目標：**{current_side_effect}** ｜ "
@@ -585,10 +669,13 @@ def main() -> None:
 
         with tab1:
             for res in all_results:
-                border_color = (
-                    "#b91c1c"
-                    if res["risk_level"] == "高風險"
-                    else ("#ea580c" if res["risk_level"] == "中風險" else "#047857")
+                border_color = {
+                    "高風險": "#b91c1c",
+                    "中風險": "#ea580c",
+                    "低風險": "#047857",
+                }.get(res["risk_level"], "#64748b")
+                count_display = (
+                    f"{res['event_count']:,}" if res["event_count"] >= 0 else "—"
                 )
                 excerpt_html = (
                     f'<div style="margin-top:0.75rem; color:#475569; font-size:0.92rem; '
@@ -606,7 +693,7 @@ def main() -> None:
                         </h3>
                         <div class="risk-meta">
                             <div><strong>FAERS 案件數：</strong>
-                                <span style="color:#0891b2; font-size:1.15rem;">{max(res['event_count'], 0):,}</span> 筆
+                                <span style="color:#0891b2; font-size:1.15rem;">{count_display}</span> 筆
                             </div>
                             <div><strong>評估依據：</strong> {res['risk_reason']}</div>
                         </div>
@@ -627,7 +714,7 @@ def main() -> None:
                 with c1:
                     st.markdown("#### 👤 通報者專業身份")
                     reporters = get_distribution_data(
-                        target_drug, current_side_effect, "primarysource.qualification"
+                        drug_terms_map[target_drug], current_side_effect, "primarysource.qualification"
                     )
                     if reporters:
                         df_r = pd.DataFrame(reporters)
@@ -641,13 +728,14 @@ def main() -> None:
                             paper_bgcolor="rgba(0,0,0,0)",
                             font=dict(color="#0f172a"),
                         )
-                        st.plotly_chart(fig_r, use_container_width=True)
+                        st.plotly_chart(fig_r, width="stretch")
                     else:
                         st.info("無足夠資料繪製通報者分佈。")
                 with c2:
                     st.markdown("#### 🎯 主要處方適應症")
                     inds = get_distribution_data(
-                        target_drug, current_side_effect, "patient.drug.drugindication.exact", 10
+                        drug_terms_map[target_drug], current_side_effect,
+                        "patient.drug.drugindication.exact", 10,
                     )
                     if inds:
                         df_ind = pd.DataFrame(inds)
@@ -659,13 +747,14 @@ def main() -> None:
                             paper_bgcolor="rgba(0,0,0,0)",
                             font=dict(color="#0f172a"),
                         )
-                        st.plotly_chart(fig_ind, use_container_width=True)
+                        st.plotly_chart(fig_ind, width="stretch")
                     else:
                         st.info("無足夠資料繪製適應症分佈。")
 
                 st.markdown("#### 🧬 共病反應 Top 10 (同案件並列出現的其他 MedDRA PT)")
                 co_reactions = get_distribution_data(
-                    target_drug, current_side_effect, "patient.reaction.reactionmeddrapt.exact", 11
+                    drug_terms_map[target_drug], current_side_effect,
+                    "patient.reaction.reactionmeddrapt.exact", 11,
                 )
                 if co_reactions:
                     df_co = pd.DataFrame(co_reactions)
@@ -683,9 +772,11 @@ def main() -> None:
                             paper_bgcolor="rgba(0,0,0,0)",
                             font=dict(color="#0f172a"),
                         )
-                        st.plotly_chart(fig_co, use_container_width=True)
+                        st.plotly_chart(fig_co, width="stretch")
                     else:
                         st.info("除目標反應外，其他共病訊號不足。")
+                else:
+                    st.info("無足夠資料繪製共病反應分佈。")
 
         with tab3:
             st.markdown("### 💊 臨床案件劑量檢閱器 (Case Browser)")
@@ -699,11 +790,13 @@ def main() -> None:
             if st.button("📥 載入案件與劑量明細"):
                 with st.spinner("正在解析 JSON 並萃取劑量與嚴重度指標..."):
                     raw_cases = get_detailed_events(
-                        target_drug, current_side_effect, limit=case_limit
+                        drug_terms_map[target_drug], current_side_effect, limit=case_limit
                     )
                     if raw_cases:
                         df_cases = parse_events_to_dataframe(
-                            raw_cases, target_drug, target_reaction=current_side_effect
+                            raw_cases,
+                            drug_terms_map[target_drug],
+                            target_reaction=current_side_effect,
                         )
                         st.session_state["df_cases"] = df_cases
                         st.session_state["cases_loaded_drug"] = target_drug
@@ -763,7 +856,7 @@ def main() -> None:
                 st.markdown(f"#### 📋 完整案件清單（{len(view_df):,} / {len(df_cases):,} 筆）")
                 st.dataframe(
                     view_df[CASE_COLUMNS],
-                    use_container_width=True,
+                    width="stretch",
                     height=600,
                     hide_index=True,
                 )
@@ -775,13 +868,13 @@ def main() -> None:
 
             summary_df = _summary_dataframe(all_results)
             st.markdown("#### 🧾 分析摘要")
-            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            st.dataframe(summary_df, width="stretch", hide_index=True)
 
             csv_summary = summary_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📄 下載分析摘要 CSV",
                 data=csv_summary,
-                file_name=f"FAERS_Summary_{current_side_effect}.csv",
+                file_name=f"FAERS_Summary_{_safe_filename(current_side_effect)}.csv",
                 mime="text/csv",
             )
 
@@ -793,7 +886,7 @@ def main() -> None:
                 st.download_button(
                     "📄 下載案件 CSV (相容 Excel 繁體中文)",
                     data=csv_cases,
-                    file_name=f"FAERS_Cases_{st.session_state.get('cases_loaded_drug', 'data')}.csv",
+                    file_name=f"FAERS_Cases_{_safe_filename(st.session_state.get('cases_loaded_drug', 'data'))}.csv",
                     mime="text/csv",
                 )
 
@@ -804,7 +897,7 @@ def main() -> None:
                 st.download_button(
                     "📊 下載完整 Excel (摘要 + 案件)",
                     data=xlsx_buf.getvalue(),
-                    file_name=f"FAERS_Report_{current_side_effect}.xlsx",
+                    file_name=f"FAERS_Report_{_safe_filename(current_side_effect)}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             else:
